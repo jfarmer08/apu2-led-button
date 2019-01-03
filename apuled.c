@@ -1,258 +1,548 @@
-/*
- * apuled - show network traffic on apu LEDs
- * Copyright (c) 2013 Christian Herzog <daduke@daduke.org>
- * based on ifled by Mattias Wadman <napolium@sudac.org>
+/*-
+ * Copyright (c) 2014-2017 Larry Baird
+ * All rights reserved.
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * Feedback provided by Ermal Luci.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * Used information from daduke's linux driver (https://daduke.org/linux/apu2)
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
  *
- * Last modified: 20140109
- * changed LED control from mmap'd memory poking to /sys/class/led/ writes
- * in order to comply with newer kernels with CONFIG_STRICT_DEVMEM set
- *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <fcntl.h>
-#include <linux/kd.h>
-#include <sys/utsname.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sys/io.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
 
+#include <sys/param.h>
+#include <sys/conf.h>
+#include <sys/bus.h>
+#include <sys/priv.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/proc.h>
+#include <dev/pci/pcireg.h>
+#include <dev/pci/pcivar.h>
+#include <sys/kernel.h>
+#include <sys/systm.h>
+#include <sys/module.h>
+#include <sys/rman.h>
+#include <x86/bus.h>
+#include <isa/isavar.h>
+#include <dev/led/led.h>
 
-const char *banner =
-		"apuled v1.0 - (c) 2013 Christian Herzog <daduke@daduke.org>\n"
-		"based on ifled by Mattias Wadman <napolium@sudac.org>\n"
-		"This program is distributed under the terms of GPL.\n";
-const char *help =
-		"%sUsage: %s interface [options]\n"
-		"\tinterface\tInterface to monitor, for example: eth0\n"
-		"Options:\n"
-		"\t-c crt\t\tLED config 3 chars, num, caps and scroll-lock.\n"
-		"\t\t\tr = Receive          t = Transmit\n"
-		"\t\t\tu = Drop (receive)   i = Drop (transmit)\n"
-		"\t\t\tj = Error (receive)  k = Error (transmit)\n"
-		"\t\t\tReceive or transmit:\n"
-		"\t\t\te = Error            d = Drop\n"
-		"\t\t\ta = Activity         c = Collision\n"
-		"\t\t\tn = None (will not touch this LED)\n"
-		"\t\t\tDefault: crt\n"
-		"\t-d delay\tLED update delay in ms. Default: 50\n"
-		"\t-f\t\tFork program into background.\n\n";
-volatile unsigned char *ptr;
+#if __FreeBSD_version < 1100000
+#   define kern_getenv(a) getenv(a)
+#endif // __FreeBSD_version < 1100000
 
+/*
+ * Basic idea is to create two MMIO memory resources. One for LEds and
+ * one for switch on front of APU.
+ */
 
-#define TRUE	1
-#define FALSE	0
+/* See dev/amdsbwd/amd_chipset.h for magic numbers for southbridges */
 
-#define IF_RX		0
-#define IF_TX		1
-#define IF_COLL		2
-#define IF_DROP_RX 	4
-#define IF_DROP_TX	5
-#define IF_ERR_TX	6
-#define IF_ERR_RX	7
+/* SB7xx RRG 2.3.3.1.1. */
+#define AMDSB_PMIO_INDEX                0xcd6
+#define AMDSB_PMIO_DATA                 (PMIO_INDEX + 1)
+#define AMDSB_PMIO_WIDTH                2
 
-#define IF_RXTX		8
-#define IF_DROP		9
-#define IF_ERR		10
-#define IF_NONE		11
+#define AMDSB_SMBUS_DEVID               0x43851002
+#define AMDFCH_SMBUS_DEVID              0x780b1022
 
-#define OPT_FORK	1
-#define OPT_KERNEL_2_0	2
+/* SB8xx RRG 2.3.7. */
+#define AMDSB8_MMIO_BASE_ADDR_FIND	0x24
 
-int ledfd[3];
-unsigned long int if_info[8]; // current interface values.
-unsigned long int l_if_info[8]; // last interface values.
-unsigned char led_config[3] = {IF_COLL,IF_RX,IF_TX};
-char options = 0;
+/* Here are some magic numbers from APU1 BIOS. */
+#define GPIO_OFFSET			0x100
+#define GPIO_187      			187       // APU1 MODESW
+#define GPIO_188      			188       // APU1 Unknown ??
+#define GPIO_189      			189       // APU1 LED1#
+#define GPIO_190      			190       // APU1 LED2#
+#define GPIO_191      			191       // APU1 LED3#
 
+#define LED_ON           		0x08
+#define LED_OFF          		0xC8
 
-void freakout(char *why) {
-	fprintf(stderr,"Error: %s\n",why);
-	exit(1);
-}
+/* Here are some magic numbers for APU2. */
+#define AMDFCH41_MMIO_ADDR      	0xfed80000u
+#define FCH_GPIO_OFFSET           	0x1500
+#define FCH_GPIO_BASE           	(AMDFCH41_MMIO_ADDR + FCH_GPIO_OFFSET)
+#define FCH_GPIO_SIZE           	0x300
+#define APU2_GPIO_BIT_WRITE          	22
+#define APU2_GPIO_BIT_READ           	16
+#define GPIO_68      			68       // APU2 LED1#
+#define GPIO_69      			69       // APU2 LED2#
+#define GPIO_70      			70       // APU2 LED3#
+#define GPIO_89      			89       // APU2 MODESW
 
-void set_led(char mode,char led) {
-	if (mode) {
-		write(ledfd[led], "1", 1);
-	} else {
-		write(ledfd[led], "0", 1);
-	}
-}
+struct apuled {
+	struct resource *res;
+	bus_size_t 	offset;
+	struct cdev    	*led;
+	int		model;
+};
 
-void update_netproc(char *interface) {
-	char b[255];
-	char dummy;
-	FILE *procfd;
-	if ((procfd = fopen("/proc/net/dev","r")) == NULL)
-		freakout("Unable to open /proc/net/dev.");
-	while (fgets(b,sizeof(b),procfd) !=  NULL) {
-		char *bp = b;
+struct apuled_softc {
+	int		sc_model;
+        int             sc_rid_type;
+	struct resource *sc_res_led;
+        int             sc_rid_led;
+	struct apuled   sc_led[3];
+	struct resource *sc_res_modesw;
+        int             sc_rid_modesw;
+	struct cdev	*sc_sw;
+};
 
-		while (*bp == ' ')
-			*bp++;
+/*
+ * Mode switch methods.
+ */
+static int      modesw_open(struct cdev *dev, int flags, int fmt,
+                        struct thread *td);
+static int      modesw_close(struct cdev *dev, int flags, int fmt,
+                        struct thread *td);
+static int      modesw_read(struct cdev *dev, struct uio *uio, int ioflag);
 
-		if (strncmp(bp,interface,strlen(interface)) == 0 && *(bp+strlen(interface)) == ':' ) {
-			bp = bp+strlen(interface)+1;
-			if (options & OPT_KERNEL_2_0)
-				sscanf(bp,"%lu %lu %lu %lu %lu %lu %lu %lu %lu %lu",
-						&if_info[IF_RX],&if_info[IF_ERR_RX],&if_info[IF_DROP_RX],
-						&dummy,&dummy,&if_info[IF_TX],&if_info[IF_ERR_TX],
-						&if_info[IF_DROP_TX],&dummy,&if_info[IF_COLL]);
-			else
-				sscanf(bp,"%lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu",
-						&if_info[IF_RX],&dummy,&if_info[IF_ERR_RX],&if_info[IF_DROP_RX],
-						&dummy,&dummy,&dummy,&dummy,&if_info[IF_TX],&dummy,
-						&if_info[IF_ERR_TX],&if_info[IF_DROP_TX],&dummy,&if_info[IF_COLL]);
-			fclose(procfd);
-			return;
+static struct cdevsw msw_cdev = {
+	.d_version =    D_VERSION,
+	.d_open =       modesw_open,
+	.d_read	=	modesw_read,
+	.d_close =      modesw_close,
+	.d_name =       "modesw",
+};
+
+/*
+ * Device methods.
+ */
+static int	apuled_probe(device_t dev);
+static int	apuled_attach(device_t dev);
+static int	apuled_detach(device_t dev);
+static void	apuled_identify(driver_t *driver, device_t parent);
+
+static device_method_t apuled_methods[] = {
+	/* Device interface */
+	DEVMETHOD(device_probe,		apuled_probe),
+	DEVMETHOD(device_attach,	apuled_attach),
+	DEVMETHOD(device_detach,	apuled_detach),
+	DEVMETHOD(device_identify,	apuled_identify),
+
+	DEVMETHOD_END
+};
+
+static driver_t apuled_driver = {
+	"apuled",
+	apuled_methods,
+	sizeof(struct apuled_softc),
+};
+
+static devclass_t apuled_devclass;
+DRIVER_MODULE(apuled, isa, apuled_driver, apuled_devclass, NULL, NULL);
+
+static int
+hw_is_apu( void )
+{
+	int apu = 0;
+	char *maker;
+	char *product;
+
+	maker = kern_getenv("smbios.system.maker");
+	if (maker != NULL) {
+		if ( 0 == strcasecmp( "PC Engines", maker ) ) {
+			product = kern_getenv("smbios.system.product");
+			if (product != NULL) {
+				if ( 0 == strcasecmp( "APU", product ) )
+					apu = 1;
+				else if ( 0 == strcasecmp( "apu2", product ) )
+					apu = 2;
+
+				freeenv(product);
+			}
 		}
+
+		freeenv(maker);
 	}
-	fclose(procfd);
-	freakout("Unable to find interface.");
+
+	return (apu);
 }
 
-char is_changed(char temp) {
-	switch(temp) {
-		case IF_RXTX:
-			return (((if_info[IF_TX] != l_if_info[IF_TX]) || (if_info[IF_RX] != l_if_info[IF_RX])) ? TRUE : FALSE);
-		case IF_DROP:
-			return (((if_info[IF_DROP_TX] != l_if_info[IF_DROP_TX]) || (if_info[IF_DROP_RX] != l_if_info[IF_DROP_RX])) ? TRUE : FALSE);
-		case IF_ERR:
-			return (((if_info[IF_ERR_TX] != l_if_info[IF_ERR_TX]) || (if_info[IF_ERR_RX] != l_if_info[IF_ERR_RX])) ? TRUE : FALSE);
-		default:
-			return (if_info[temp] != l_if_info[temp] ? TRUE : FALSE);
-	}
-}
+static void
+apu_led_callback(void *ptr, int onoff)
+{
+	struct apuled *led = (struct apuled *)ptr;
 
-void update_leds() {
-	char led;
-	for (led=0;led < 3;led++) {
-		if(led_config[led] == IF_NONE)
-			continue;
-		if(is_changed(led_config[led]))
-			set_led(TRUE,led);
+	switch(led->model) {
+	case 1: {
+		u_int8_t value;
+
+		value = bus_read_1(led->res, led->offset);
+
+		if ( onoff )
+			value = LED_ON;
 		else
-			set_led(FALSE,led);
+			value = LED_OFF;
+
+		bus_write_1(led->res, led->offset, value);
+		break;
 	}
-	memcpy(&l_if_info,&if_info,sizeof(if_info));
-}
 
-char select_mode(char mode) {
-	switch(mode) {
-		case 'r': return IF_RX;
-		case 't': return IF_TX;
-		case 'e': return IF_ERR;
-		case 'c': return IF_COLL;
-		case 'd': return IF_DROP;
-		case 'a': return IF_RXTX;
-		case 'u': return IF_DROP_RX;
-		case 'i': return IF_DROP_TX;
-		case 'j': return IF_ERR_RX;
-		case 'k': return IF_ERR_TX;
-		default: return IF_NONE;
+	case 2: {
+		u_int32_t value;
+		u_int32_t active_bit = 1 << APU2_GPIO_BIT_WRITE;
+
+		value = bus_read_4(led->res, led->offset);
+
+		if ( onoff )
+			value &= ~active_bit;
+		else
+			value |= active_bit;
+
+		bus_write_4(led->res, led->offset, value);
+		break;
+	}
+
+	default:
+		break;
 	}
 }
 
-void signal_handler(int signal) {
-	exit(0);
-}
+/* Check to see if this might be an APU board? Nothing too expensive */
+static void
+apuled_identify(driver_t *driver, device_t parent)
+{
+	device_t	child;
+	device_t	smb;
+	int id;
 
-void fork_program() {
-	pid_t program_pid;
-	program_pid = fork();
-	if (program_pid == -1)
-		freakout("Unable to fork program.");
-	if (program_pid != 0)
-		exit(0);
-}
+	if (resource_disabled("apuled", 0))
+		return;
 
-int main(int argc, char *argv[]) {
-	FILE *procfd;
-	int delay = 50;
-	struct utsname uname_dummy;
-	char arg_dummy;
+	if (device_find_child(parent, "apuled", -1) != NULL) 
+		return;
 
-	if (argc < 3) {
-		printf(help,banner,argv[0]);
-		exit(0);
+	/* Do was have expected south bridge chipset? */
+	smb = pci_find_bsf(0, 20, 0);
+	if (smb == NULL)
+		return;
+
+	id=pci_get_devid(smb);
+
+	switch(hw_is_apu()) {
+	case 1:
+		if ( id != AMDSB_SMBUS_DEVID )
+			return;
+		break;
+	case 2:
+		if ( id != AMDFCH_SMBUS_DEVID )
+			return;
+		break;
+
+	default:
+		return;
 	}
-	for (arg_dummy=2;arg_dummy < argc;arg_dummy++) {
-		if(argv[arg_dummy][0] != '-') {
-			printf("Error: option: %s\n",argv[arg_dummy]);
-			exit(1);
+
+	/* Everything looks good, enable probe */
+	child = BUS_ADD_CHILD(parent, ISA_ORDER_SPECULATIVE, "apuled", -1);
+	if ( child == NULL )
+		device_printf(parent, "apuled: bus add child failed\n");
+}
+
+static int 
+apuled_probe_apu1(device_t dev, struct apuled_softc *sc)
+{
+	struct resource         *res;
+	int			rc;
+	uint32_t		gpio_mmio_base;
+	int			rid;
+	int			i;
+
+	/* Find the ACPImmioAddr base address */
+	rc = bus_set_resource(dev, SYS_RES_IOPORT, 0, AMDSB_PMIO_INDEX,
+	    AMDSB_PMIO_WIDTH);
+	if (rc != 0) {
+		device_printf(dev, "bus_set_resource for MMIO failed\n");
+		return (ENXIO);
+	}
+
+	rid = 0;
+	res = bus_alloc_resource(dev, SYS_RES_IOPORT, &rid, 0ul, ~0ul,
+	    AMDSB_PMIO_WIDTH, RF_ACTIVE | RF_SHAREABLE);
+
+	if (res == NULL) {
+		device_printf(dev, "bus_alloc_resource for MMIO failed.\n");
+		return (ENXIO);
+	}
+
+	/* Find base address of memory mapped WDT registers. */
+	/* This will probable be 0xfed80000 */
+	for (gpio_mmio_base = 0, i = 0; i < 4; i++) {
+		gpio_mmio_base <<= 8;
+		bus_write_1(res, 0, AMDSB8_MMIO_BASE_ADDR_FIND + 3 - i);
+		gpio_mmio_base |= bus_read_1(res, 1);
+	}
+	gpio_mmio_base &= ~0x07u;
+
+	if ( bootverbose )
+		device_printf(dev, "MMIO base adddress 0x%x\n", gpio_mmio_base);
+
+	bus_release_resource(dev, SYS_RES_IOPORT, rid, res);
+	bus_delete_resource(dev, SYS_RES_IOPORT, rid);
+
+	/* Set memory resource for LEDs. */
+	rc = bus_set_resource(dev, SYS_RES_MEMORY, 0,
+	    gpio_mmio_base + GPIO_OFFSET + GPIO_189,
+	    (GPIO_191 - GPIO_189) + 1);
+	if (rc != 0) {
+		device_printf(dev, "bus_set_resource for LEDs failed\n");
+		return (ENXIO);
+	}
+
+	/* Set memory resource for modesw. */
+	rc = bus_set_resource(dev, SYS_RES_MEMORY, 1,
+	    gpio_mmio_base + GPIO_OFFSET + GPIO_187, 1);
+	if (rc != 0) {
+		device_printf(dev, "bus_set_resource for modesw failed\n");
+		return (ENXIO);
+	}
+
+	return (0);
+}
+
+static int 
+apuled_probe_apu2(device_t dev, struct apuled_softc *sc)
+{
+	int			rc;
+
+	/* Set memory resource for LEDs. */
+	rc = bus_set_resource(dev, SYS_RES_MEMORY, 0,
+	    FCH_GPIO_BASE + (GPIO_68 * sizeof(uint32_t)),
+	    ((GPIO_70 - GPIO_68) + 1) * sizeof(uint32_t) );
+	if (rc != 0) {
+		device_printf(dev, "bus_set_resource for LEDs failed\n");
+		return (ENXIO);
+	}
+
+	/* Set memory resource for modesw. */
+	rc = bus_set_resource(dev, SYS_RES_MEMORY, 1,
+	    FCH_GPIO_BASE + (GPIO_89 * sizeof(uint32_t)),
+	    sizeof(uint32_t) );
+	if (rc != 0) {
+		device_printf(dev, "bus_set_resource for modesw failed\n");
+		return (ENXIO);
+	}
+
+	return (0);
+}
+
+
+static int
+apuled_probe(device_t dev)
+{
+	int			error;
+	char			buf[100];
+	struct apuled_softc 	*sc = device_get_softc(dev);
+
+	/* Make sure we do not claim some ISA PNP device. */
+	if (isa_get_logicalid(dev) != 0)
+		return (ENXIO);
+
+	sc->sc_model = hw_is_apu();
+	if ( sc->sc_model == 0 )
+		return (ENXIO);
+
+	snprintf(buf, sizeof(buf), "APU%d", sc->sc_model);
+	device_set_desc_copy(dev, buf );
+
+	switch( sc->sc_model ) {
+	case 1:
+		error = apuled_probe_apu1( dev, sc );
+		if (error)
+		    return error;
+		break;
+
+	case 2:
+		error = apuled_probe_apu2( dev, sc );
+		if (error)
+		    return error;
+		break;
+
+	default:	/* Should never reach here. */
+		device_printf(dev, "Unexpected APU model\n" );
+		return (ENXIO);
+		break;
+	}
+
+	return (0);
+}
+
+
+static int
+apuled_attach(device_t dev)
+{
+	struct apuled_softc *sc = device_get_softc(dev);
+	int i;
+
+	sc->sc_rid_type = SYS_RES_MEMORY;
+	sc->sc_res_led = NULL;
+	sc->sc_rid_led = 0;
+	sc->sc_res_modesw = NULL;
+	sc->sc_rid_modesw = 1;
+
+	/* Allocate LEDs memory region */
+	sc->sc_res_led = bus_alloc_resource_any( dev, sc->sc_rid_type,
+	    &sc->sc_rid_led, RF_ACTIVE | RF_SHAREABLE);
+	if ( sc->sc_res_led == NULL ) {
+		device_printf( dev, "Unable to allocate LED memory region\n" );
+		return (ENXIO);
+	}
+
+	/* Allocate modesw memory region */
+	sc->sc_res_modesw = bus_alloc_resource_any( dev, sc->sc_rid_type,
+	    &sc->sc_rid_modesw, RF_ACTIVE | RF_SHAREABLE);
+	if ( sc->sc_res_modesw == NULL ) {
+		bus_release_resource(dev, sc->sc_rid_type, sc->sc_rid_led,
+		    sc->sc_res_led);
+		sc->sc_res_led = NULL;
+		device_printf( dev,
+		    "Unable to allocate modesw memory region\n" );
+		return (ENXIO);
+	}
+
+	sc->sc_sw = make_dev(&msw_cdev, 0, UID_ROOT, GID_WHEEL, 0440, "modesw");
+	sc->sc_sw->si_drv1 = sc;
+
+	for ( i = 0; i < 3; i++ ) {
+		char name[30];
+
+		snprintf( name, sizeof(name), "led%d", i + 1 );
+
+		sc->sc_led[ i ].res = sc->sc_res_led;
+		sc->sc_led[ i ].model = sc->sc_model;
+
+		if ( sc->sc_model == 1 )
+		    sc->sc_led[ i ].offset = i;
+		else
+		    sc->sc_led[ i ].offset = i * sizeof(uint32_t);
+
+		sc->sc_led[ i ].led = led_create(apu_led_callback,
+		    &sc->sc_led[ i ], name);
+
+		if ( sc->sc_led[ i ].led == NULL ) {
+			device_printf( dev, "%s creation failed\n", name );
+
+		} else if ( i == 0 ) {
+			/* Make sure power LED stays on by default */
+			apu_led_callback(&sc->sc_led[ i ], TRUE);
 		}
-		switch (argv[arg_dummy][1]) {
-			case 'c':
-				if(argv[arg_dummy+1] == NULL || strlen(argv[arg_dummy+1]) != 3)
-					freakout("-c option needs 3 chars");
-				led_config[0] = select_mode(argv[arg_dummy+1][0]);
-				led_config[1] = select_mode(argv[arg_dummy+1][1]);
-				led_config[2] = select_mode(argv[arg_dummy+1][2]);
-				arg_dummy++;
-				break;
-			case 'd':
-				if(argv[arg_dummy+1] == NULL)
-					freakout("-d option needs an integer");
-				delay = atol(argv[arg_dummy+1]);
-				arg_dummy++;
-				break;
-			case 'f':
-				options |= OPT_FORK;
-				break;
-			default:
-				printf("Error: option: %s\n",argv[arg_dummy]);
-				exit(1);
-				break;
+	}
+
+	return (0);
+}
+
+int
+apuled_detach(device_t dev)
+{
+	struct apuled_softc *sc = device_get_softc(dev);
+	int i;
+
+	for ( i = 0; i < 3; i++ )
+		if ( sc->sc_led[ i ].led != NULL ) {
+			/* Restore LEDs to stating state */
+			if ( i == 0 )
+				apu_led_callback(&sc->sc_led[ i ], TRUE);
+			else
+				apu_led_callback(&sc->sc_led[ i ], FALSE);
+
+			led_destroy(sc->sc_led[ i ].led);
 		}
-	}
-	if (options & OPT_FORK)
-		fork_program();
-	else
-		printf("%s", banner);
-	signal(SIGINT,signal_handler);
-	signal(SIGTERM,signal_handler);
-	update_netproc(argv[1]);
-	memcpy(&l_if_info,&if_info,sizeof(if_info));
 
-
-	char fd[255];
-	int led;
-	for (led=0;led < 3;led++) {
-		sprintf(fd, "/sys/class/leds/apu:%d/brightness", led+1);
-		ledfd[led] = open(fd, O_WRONLY);
+	if ( sc->sc_res_led != NULL ) {
+		bus_release_resource(dev, sc->sc_rid_type, sc->sc_rid_led,
+		    sc->sc_res_led);
+		bus_delete_resource(dev, sc->sc_rid_type, sc->sc_rid_led );
 	}
 
+	if ( sc->sc_res_modesw != NULL ) {
+		bus_release_resource(dev, sc->sc_rid_type, sc->sc_rid_modesw,
+		    sc->sc_res_modesw);
+		bus_delete_resource(dev, sc->sc_rid_type, sc->sc_rid_modesw );
+	}
 
-	while(1) {
-		#if DEBUG
-		printf("tx:%lu rx:%lu coll:%lu tx_drop:%lu rx_drop:%lu err_tx:%lu err_rx:%lu\n",
-				if_info[IF_TX],if_info[IF_RX],if_info[IF_COLL],if_info[IF_DROP_TX],
-				if_info[IF_DROP_RX],if_info[IF_ERR_TX],if_info[IF_ERR_RX]);
-		#endif
-		update_netproc(argv[1]);
-		update_leds();
-		usleep(delay*1000);
+	if ( sc->sc_sw != NULL )
+	    destroy_dev(sc->sc_sw);
+
+	return (0);
+}
+
+static int
+modesw_open(struct cdev *dev __unused, int flags __unused, int fmt __unused,
+    struct thread *td)
+{
+	int error;
+
+	error = priv_check(td, PRIV_IO);
+	if (error != 0)
+		return (error);
+	error = securelevel_gt(td->td_ucred, 0);
+
+	return (error);
+}
+
+static int
+modesw_read(struct cdev *dev, struct uio *uio, int ioflag) {
+	struct apuled_softc *sc = dev->si_drv1;
+        char ch = '0';
+        int error;
+
+	switch(sc->sc_model) {
+	case 1: {
+		uint8_t value;
+
+		/* Is mode switch pressed? */
+		value = bus_read_1(sc->sc_res_modesw, 0 );
+
+		if (value == 0x28 )
+			ch = '1';
+		break;
 	}
-	for (led=0;led < 3;led++) {
-		close(ledfd[led]);
+
+	case 2: {
+		uint32_t value;
+
+		/* Is mode switch pressed? */
+		value = bus_read_4(sc->sc_res_modesw, 0 );
+
+		if ( ! ((value >> APU2_GPIO_BIT_READ) & 1) )
+			ch = '1';
+		break;
 	}
-	return 0;
+
+	default:
+		break;
+	}
+
+	error = uiomove(&ch, sizeof(ch), uio);
+
+	return (error);
+}
+
+static int
+modesw_close(struct cdev *dev __unused, int flags __unused, int fmt __unused,
+    struct thread *td __unused)
+{
+	return (0);
 }
